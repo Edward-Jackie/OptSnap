@@ -1,0 +1,22 @@
+[project]
+name = "optsnap"
+version = "0.1.0"
+description = "AltSnap-like window manager for macOS: Option+drag move, resize, and scroll transparency"
+requires-python = ">=3.10"
+dependencies = [
+    "pyobjc-framework-Quartz>=12.1",
+    "pyobjc-framework-ApplicationServices>=12.1",
+    "pyobjc-framework-CoreText>=12.1",
+    "rumps>=0.4.0",
+    "py2app>=0.28.10",
+]
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
