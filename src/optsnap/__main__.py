@@ -6,15 +6,29 @@ import time
 import sys
 import os
 
+import AppKit
 import rumps
 
 from optsnap.core import OptSnapCore, _modifier_to_name, _toggle_keycode_to_name
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG if os.environ.get("OPTSNAP_DEBUG") else logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
 )
 logger = logging.getLogger(__name__)
+
+_MENUBAR_ICON = os.path.join(os.path.dirname(__file__), "resources", "menubar_icon.png")
+
+
+def _sf_icon(name):
+    """Build a template NSImage from an SF Symbol name, or None if unavailable."""
+    try:
+        image = AppKit.NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, None)
+        if image is not None:
+            image.setTemplate_(True)
+        return image
+    except Exception:
+        return None
 
 
 class OptSnapMenuApp(rumps.App):
@@ -25,9 +39,17 @@ class OptSnapMenuApp(rumps.App):
         core.on_state_change = self._refresh_menu
         super().__init__(
             name="OptSnap",
-            title="⬡",
-            quit_button=rumps.MenuItem("退出 OptSnap", callback=self._quit),
+            icon=_MENUBAR_ICON if os.path.exists(_MENUBAR_ICON) else None,
+            title=None if os.path.exists(_MENUBAR_ICON) else "⬡",
+            # rumps normally adds its own quit_button to the menu exactly once, when
+            # .run() starts. We rebuild the menu ourselves on every state change (see
+            # _build_menu), so we own the quit item entirely instead — quit_button=None
+            # stops rumps from also trying to insert it (that second insert would raise
+            # "Item to be inserted into menu already is in another menu").
+            quit_button=None,
         )
+        self._quit_item = rumps.MenuItem("退出 OptSnap", callback=self._quit)
+        self._quit_item._menuitem.setImage_(_sf_icon("xmark.circle"))
         self._build_menu()
 
     def _refresh_menu(self):
@@ -47,14 +69,33 @@ class OptSnapMenuApp(rumps.App):
         status_icon = "●" if enabled else "○"
         status_text = "已启用" if enabled else "已禁用"
 
+        status_item = rumps.MenuItem(f"{status_icon} {status_text}")
+        toggle_item = rumps.MenuItem("切换启用/禁用", callback=self._toggle)
+        modifier_item = rumps.MenuItem(f"修饰键: {modifier_name}", callback=self._cycle_modifier)
+        toggle_key_item = rumps.MenuItem(f"激活键: {toggle_name}", callback=self._cycle_toggle_key)
+
+        status_item._menuitem.setImage_(_sf_icon("power.circle.fill" if enabled else "power.circle"))
+        toggle_item._menuitem.setImage_(_sf_icon("power"))
+        modifier_item._menuitem.setImage_(_sf_icon("option"))
+        toggle_key_item._menuitem.setImage_(_sf_icon("keyboard"))
+
+        # rumps' `menu = [...]` setter calls Menu.update(), which *adds* items whose
+        # key (title text) isn't already present rather than replacing the menu — since
+        # these titles embed dynamic state, every rebuild was appending a fresh set of
+        # stale items instead of replacing the old ones. Clear first so rebuilds don't
+        # accumulate.
+        self.menu.clear()
         self.menu = [
-            rumps.MenuItem(f"{status_icon} {status_text}"),
+            status_item,
             rumps.separator,
-            rumps.MenuItem("切换启用/禁用", callback=self._toggle),
-            rumps.MenuItem(f"修饰键: {modifier_name}", callback=self._cycle_modifier),
-            rumps.MenuItem(f"激活键: {toggle_name}", callback=self._cycle_toggle_key),
+            toggle_item,
+            modifier_item,
+            toggle_key_item,
             rumps.separator,
         ]
+        # clear() wipes the quit item too, so re-add it every rebuild (see __init__
+        # for why we own it instead of rumps' built-in quit_button).
+        self.menu.add(self._quit_item)
 
     def _toggle(self, sender):
         self.core.toggle()

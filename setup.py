@@ -16,7 +16,7 @@ OPTIONS = {
         'NSHumanReadableCopyright': 'OptSnap',
     },
     'packages': ['optsnap'],
-    'iconfile': None,  # Add path to .icns file if you have one
+    'iconfile': 'assets/icon.icns',
     'includes': [
         'Quartz',
         'ApplicationServices',

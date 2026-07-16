@@ -14,6 +14,10 @@ _MACOS_MAJOR = int(platform.mac_ver()[0].split('.')[0])
 
 _alpha_cache = {}  # window_id → user-facing opacity (1.0 = fully visible)
 
+# Throttle: only call the AX API every N ms to avoid flooding the target app
+# with synchronous cross-process calls during rapid drag events.
+DRAG_THROTTLE_MS = 16  # ~60fps
+
 
 # ── Move Action ───────────────────────────────────────────────────────────
 
@@ -39,8 +43,15 @@ class MoveAction:
                 self.start_win_x = 0
                 self.start_win_y = 0
 
+        self._last_update = 0  # Ensure first update always fires
+
     def update(self, current_mouse_x, current_mouse_y):
         """Apply delta from initial click position."""
+        now = time.time()
+        if (now - self._last_update) * 1000 < DRAG_THROTTLE_MS:
+            return
+        self._last_update = now
+
         dx = current_mouse_x - self.start_mouse_x
         dy = current_mouse_y - self.start_mouse_y
 
@@ -51,10 +62,6 @@ class MoveAction:
 
 
 # ── Resize Action ─────────────────────────────────────────────────────────
-
-# Throttle: only call AX API every N ms to avoid lag
-RESIZE_THROTTLE_MS = 16  # ~60fps
-
 
 class ResizeAction:
     """Simple resize: right-click drag adjusts width/height from bottom-right."""
@@ -89,7 +96,7 @@ class ResizeAction:
         """Resize window: width += dx, height += dy."""
         # Throttle to avoid spamming AX API
         now = time.time()
-        if (now - self._last_update) * 1000 < RESIZE_THROTTLE_MS:
+        if (now - self._last_update) * 1000 < DRAG_THROTTLE_MS:
             return
         self._last_update = now
 
@@ -123,8 +130,11 @@ def adjust_alpha(window_id, scroll_delta, bounds=None):
         current_opacity = _alpha_cache.get(window_id, 1.0)
         delta = ALPHA_STEP if scroll_delta > 0 else -ALPHA_STEP
         new_opacity = max(ALPHA_MIN, min(ALPHA_MAX, current_opacity + delta))
-        # overlay_dim = 1.0 - opacity, capped at 0.8 to avoid fully blocking
-        overlay_dim = min(0.8, 1.0 - new_opacity)
+        # overlay_dim = 1.0 - opacity; naturally bounded by ALPHA_MIN/ALPHA_MAX.
+        # No extra cap needed here — unlike a flat black panel, a frosted-glass
+        # overlay stays legible even near full dim, so it doesn't need to be
+        # capped short of fully opaque.
+        overlay_dim = 1.0 - new_opacity
         from optsnap.overlay import set_overlay_dim
         set_overlay_dim(window_id, overlay_dim, bounds)
         _alpha_cache[window_id] = new_opacity

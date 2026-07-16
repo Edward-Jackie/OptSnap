@@ -1,7 +1,15 @@
-"""Window dimming overlay for macOS 15+ (SkyLight alpha API unavailable cross-process)."""
+"""Window dimming overlay for macOS 15+ (SkyLight alpha API unavailable cross-process).
+
+Renders as a frosted-glass blur — a light, adjustable-radius blur via the private
+SLSSetWindowBackgroundBlurRadius API (the same one iTerm2 uses for its "Blur content
+behind window" option) — rather than a flat color, so dimming doesn't read as "the
+window turned black."
+"""
 
 import logging
 import platform
+
+from optsnap.window import set_window_blur_radius
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +53,19 @@ def set_overlay_dim(window_id, dim_alpha, bounds):
             ns_y = screen_h - bounds['y'] - bounds['h']
             ns_rect = ((ns_x, ns_y), (bounds['w'], bounds['h']))
 
+            # dim_alpha (0..~0.9) drives a real, continuously adjustable blur radius
+            # via SLSSetWindowBackgroundBlurRadius — this is the primary "dimmed"
+            # signal. The white tint is kept deliberately faint (just enough to be
+            # visible over a flat-colored window with nothing to blur); confirmed
+            # empirically that SLSSetWindowAlpha can't make the *target* window
+            # itself translucent cross-process on macOS 15+ (call reports success
+            # but the alpha never actually changes), so this panel-over-the-window
+            # blur is the closest available approximation to "see-through," not a
+            # true match for it — a heavier tint here would fight against that.
+            blur_radius = int(dim_alpha * 48)
+            tint_alpha = dim_alpha * 0.12
+            tint = AppKit.NSColor.colorWithWhite_alpha_(1.0, tint_alpha)
+
             if window_id not in _overlays:
                 panel = AppKit.NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
                     ns_rect,
@@ -52,7 +73,7 @@ def set_overlay_dim(window_id, dim_alpha, bounds):
                     AppKit.NSBackingStoreBuffered,
                     False,
                 )
-                panel.setBackgroundColor_(AppKit.NSColor.blackColor())
+                panel.setBackgroundColor_(tint)
                 panel.setIgnoresMouseEvents_(True)
                 panel.setLevel_(AppKit.NSFloatingWindowLevel)
                 panel.setHasShadow_(False)
@@ -62,19 +83,15 @@ def set_overlay_dim(window_id, dim_alpha, bounds):
                     | AppKit.NSWindowCollectionBehaviorTransient
                     | AppKit.NSWindowCollectionBehaviorIgnoresCycle
                 )
-                # Ensure contentView also has black background
-                panel.contentView().setWantsLayer_(True)
-                panel.contentView().layer().setBackgroundColor_(
-                    AppKit.NSColor.blackColor().CGColor()
-                )
-                panel.setAlphaValue_(dim_alpha)
                 panel.orderFrontRegardless()
+                set_window_blur_radius(panel.windowNumber(), blur_radius)
                 _overlays[window_id] = panel
             else:
                 panel = _overlays[window_id]
                 panel.setFrame_display_(ns_rect, False)
-                panel.setAlphaValue_(dim_alpha)
+                panel.setBackgroundColor_(tint)
                 panel.orderFrontRegardless()
+                set_window_blur_radius(panel.windowNumber(), blur_radius)
 
             # Remove when fully transparent
             if dim_alpha <= 0:

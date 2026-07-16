@@ -200,22 +200,35 @@ class OptSnapCore:
         loc = CGEventGetLocation(event)
         raw_type = CGEventGetType(event)
 
+        # Any Down event while we're not idle means a previous action never got a
+        # matching Up (tap timeout/recreate, or an Up event we somehow missed) —
+        # without this, mode stays wedged and every future Down of that button
+        # type is silently ignored below until something else happens to reset it.
+        if self.mode != "idle" and raw_type in (kCGEventLeftMouseDown, kCGEventRightMouseDown):
+            logger.debug(f"{raw_type} while mode={self.mode} (stale) — force-resetting to idle first")
+            self.mode = "idle"
+            self.current_action = None
+
         # IDLE → action start
         if self.mode == "idle" and modifier_held:
             if raw_type == kCGEventLeftMouseDown:
                 window_id, ax_ref, bounds = win.get_window_at_point(loc.x, loc.y)
                 if window_id is None:
+                    logger.debug(f"LeftMouseDown+modifier at ({loc.x:.0f}, {loc.y:.0f}) but no window found — ignoring")
                     return event
                 self.current_action = MoveAction(window_id, ax_ref, loc.x, loc.y, bounds)
                 self.mode = "moving"
+                logger.debug(f"mode -> moving (window={window_id})")
                 return None
 
             elif raw_type == kCGEventRightMouseDown:
                 window_id, ax_ref, bounds = win.get_window_at_point(loc.x, loc.y)
                 if window_id is None:
+                    logger.debug(f"RightMouseDown+modifier at ({loc.x:.0f}, {loc.y:.0f}) but no window found — ignoring")
                     return event
                 self.current_action = ResizeAction(window_id, ax_ref, loc.x, loc.y, bounds)
                 self.mode = "resizing"
+                logger.debug(f"mode -> resizing (window={window_id})")
                 return None
 
             elif raw_type == kCGEventScrollWheel:
@@ -237,8 +250,11 @@ class OptSnapCore:
 
         # Resizing
         if self.mode == "resizing" and raw_type == kCGEventRightMouseDragged:
-            if self.current_action:
+            if self.current_action and modifier_held:
                 self.current_action.update(loc.x, loc.y)
+            elif not modifier_held:
+                self.mode = "idle"
+                self.current_action = None
             return None
 
         # Alpha adjustment is handled in the idle + modifier branch above.
@@ -247,6 +263,7 @@ class OptSnapCore:
         # Mouse up → IDLE
         if raw_type in (kCGEventLeftMouseUp, kCGEventRightMouseUp):
             if self.mode != "idle":
+                logger.debug(f"{raw_type} -> mode reset to idle (was {self.mode})")
                 self.mode = "idle"
                 self.current_action = None
             return event

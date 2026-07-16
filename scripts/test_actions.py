@@ -41,6 +41,23 @@ def test_move_action_fallback():
     print("  MoveAction fallback: PASS")
 
 
+def test_move_action_throttle():
+    """Test MoveAction throttles rapid updates like ResizeAction does."""
+    from optsnap.actions import MoveAction
+
+    ax_ref = MagicMock()
+    bounds = {'x': 100, 'y': 200, 'w': 300, 'h': 400}
+
+    action = MoveAction(1234, ax_ref, 500, 600, bounds)
+
+    with patch('optsnap.actions.win.set_window_position') as mock_set:
+        action.update(550, 630)  # first update always fires
+        action.update(560, 640)  # immediate second update should be throttled
+        assert mock_set.call_count == 1
+
+    print("  MoveAction throttle: PASS")
+
+
 def test_resize_action_simple():
     """Test ResizeAction: drag adjusts size from bottom-right."""
     from optsnap.actions import ResizeAction
@@ -113,6 +130,7 @@ def main():
     tests = [
         test_move_action,
         test_move_action_fallback,
+        test_move_action_throttle,
         test_resize_action_simple,
         test_resize_action_minimum_size,
         test_alpha_action_clamping,

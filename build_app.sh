@@ -38,6 +38,8 @@ cat > "${CONTENTS}/Info.plist" << 'EOF'
     <string>0.1.0</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>CFBundleIconFile</key>
+    <string>icon.icns</string>
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>
     <key>NSHumanReadableCopyright</key>
@@ -49,6 +51,11 @@ cat > "${CONTENTS}/Info.plist" << 'EOF'
 </dict>
 </plist>
 EOF
+
+# Copy app icon
+if [ -f "${PROJECT_DIR}/assets/icon.icns" ]; then
+    cp "${PROJECT_DIR}/assets/icon.icns" "${RESOURCES}/icon.icns"
+fi
 
 # Create Python launcher
 VENV_PYTHON="${PROJECT_DIR}/.venv/bin/python3"

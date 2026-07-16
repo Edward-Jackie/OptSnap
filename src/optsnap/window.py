@@ -117,6 +117,14 @@ SLSGetWindowAlpha = _sl.SLSGetWindowAlpha
 SLSGetWindowAlpha.argtypes = [ctypes.c_int, ctypes.c_uint32, ctypes.POINTER(ctypes.c_float)]
 SLSGetWindowAlpha.restype = ctypes.c_int
 
+# Same private API iTerm2 uses for its "Blur content behind window" option. Unlike
+# SLSSetWindowAlpha (arbitrary window, broken cross-process on macOS 15+), this only
+# needs to work on a window WE own (the dimming overlay panel), so it isn't affected
+# by that restriction.
+SLSSetWindowBackgroundBlurRadius = _sl.SLSSetWindowBackgroundBlurRadius
+SLSSetWindowBackgroundBlurRadius.argtypes = [ctypes.c_int, ctypes.c_uint32, ctypes.c_int]
+SLSSetWindowBackgroundBlurRadius.restype = ctypes.c_int
+
 _connection_id = None
 
 
@@ -134,6 +142,20 @@ def set_window_alpha(window_id, alpha):
     err = SLSSetWindowAlpha(cid, window_id, ctypes.c_float(alpha))
     if err != 0:
         logger.warning(f"SLSSetWindowAlpha({window_id}, {alpha:.2f}) failed: CGError {err}")
+    return err
+
+
+def set_window_blur_radius(window_number, radius):
+    """Set background blur radius (pixels) for a window OWNED BY THIS PROCESS.
+
+    Only reliable for our own windows — see the SLSSetWindowBackgroundBlurRadius
+    binding above for why this doesn't hit the same cross-process restriction as
+    set_window_alpha.
+    """
+    cid = get_connection_id()
+    err = SLSSetWindowBackgroundBlurRadius(cid, window_number, int(radius))
+    if err != 0:
+        logger.warning(f"SLSSetWindowBackgroundBlurRadius({window_number}, {radius}) failed: CGError {err}")
     return err
 
 
