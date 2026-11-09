@@ -269,6 +269,12 @@ def set_pinned(window_id, pinned):
             _pinned_state[window_id] = True
         else:
             _pinned_state.pop(window_id, None)
+        # 描边只是视觉标记：即使它失败了，置顶本身也是成功的，所以不参与返回值
+        try:
+            from optsnap import border
+            border.set_border(window_id, pinned)
+        except Exception as e:
+            logger.debug(f"更新置顶描边失败 (window={window_id}): {e}")
         logger.info(f"窗口 {window_id} {'置顶' if pinned else '取消置顶'}")
     return ok
 
@@ -318,14 +324,26 @@ def pinned_count():
 def reset_all_pins():
     """取消所有置顶（禁用/退出时调用），避免窗口卡在浮动层。"""
     if not _pinned_state:
+        _clear_borders()
         return
     if not _heartbeat_alive():
         _pinned_state.clear()
+        _clear_borders()
         return
     for window_id in list(_pinned_state.keys()):
         _send_command(window_id, PIN_LEVEL_NORMAL)
     _pinned_state.clear()
+    _clear_borders()
     logger.info("已取消所有窗口置顶")
+
+
+def _clear_borders():
+    """清掉所有描边。描边失败不能影响置顶状态的清理。"""
+    try:
+        from optsnap import border
+        border.remove_all_borders()
+    except Exception as e:
+        logger.debug(f"清除置顶描边失败: {e}")
 
 
 def channel_status():

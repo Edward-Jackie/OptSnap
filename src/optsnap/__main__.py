@@ -13,7 +13,7 @@ import rumps
 
 from optsnap import permissions, pin
 from optsnap import window as win
-from optsnap.core import OptSnapCore, _modifier_to_name, _toggle_keycode_to_name, _pin_keycode_to_name
+from optsnap.core import OptSnapCore, _modifier_to_name, _toggle_keycode_to_name, _hotkey_to_name
 
 logging.basicConfig(
     level=logging.DEBUG if os.environ.get("OPTSNAP_DEBUG") else logging.INFO,
@@ -68,7 +68,7 @@ class OptSnapMenuApp(rumps.App):
         enabled = self.core.enabled
         modifier_name = _modifier_to_name(self.core.modifier_mask)
         toggle_name = _toggle_keycode_to_name(self.core.toggle_keycode)
-        pin_name = _pin_keycode_to_name(self.core.pin_keycode)
+        pin_name = _hotkey_to_name(self.core.pin_keycode, self.core.pin_modifiers)
 
         status_icon = "●" if enabled else "○"
         status_text = "已启用" if enabled else "已禁用"
@@ -109,7 +109,7 @@ class OptSnapMenuApp(rumps.App):
         pin_state_item = rumps.MenuItem(f"置顶状态: {pin_state_text}")
         pin_state_item._menuitem.setImage_(_sf_icon("info.circle"))
 
-        pin_key_item = rumps.MenuItem(f"置顶键: {pin_name}", callback=self._cycle_pin_key)
+        pin_key_item = rumps.MenuItem(f"置顶热键: {pin_name}", callback=self._cycle_pin_key)
         pin_key_item._menuitem.setImage_(_sf_icon("keyboard"))
 
         items = [
@@ -324,7 +324,7 @@ def main():
 
     print(f"[OptSnap] 修饰键: {_modifier_to_name(core.modifier_mask)}")
     print(f"[OptSnap] 激活键: {_toggle_keycode_to_name(core.toggle_keycode)}")
-    print(f"[OptSnap] 置顶键: {_pin_keycode_to_name(core.pin_keycode)}")
+    print(f"[OptSnap] 置顶热键: {_hotkey_to_name(core.pin_keycode, core.pin_modifiers)}")
 
     core.run_in_thread()
 

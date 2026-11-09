@@ -39,6 +39,7 @@ from Quartz import (
     kCGEventFlagMaskAlternate,
     kCGEventFlagMaskControl,
     kCGEventFlagMaskCommand,
+    kCGEventFlagMaskShift,
     kCGScrollWheelEventDeltaAxis1,
     kCGKeyboardEventKeycode,
     kCGEventTapDisabledByTimeout,
@@ -63,9 +64,9 @@ from optsnap.config import (
     TOGGLE_KEYCODE,
     MODIFIER_NAME,
     HEALTH_CHECK_INTERVAL,
-    PIN_KEYCODE,
-    PIN_KEYCODES,
-    PIN_KEY_NAMES,
+    PIN_HOTKEY_KEYCODE,
+    PIN_HOTKEY_MODIFIERS,
+    PIN_HOTKEYS,
 )
 from optsnap.actions import MoveAction, ResizeAction, adjust_alpha, reset_all_alpha
 
@@ -75,6 +76,16 @@ _MODIFIERS = {
     "alternate": kCGEventFlagMaskAlternate,
     "control": kCGEventFlagMaskControl,
     "command": kCGEventFlagMaskCommand,
+    "shift": kCGEventFlagMaskShift,
+}
+
+# 置顶热键可用的修饰键。和 _MODIFIERS 分开：_MODIFIERS 是「拖拽操作」的修饰键
+# （一次只按一个），这里允许组合。
+_PIN_MODIFIER_FLAGS = {
+    "alternate": kCGEventFlagMaskAlternate,
+    "control": kCGEventFlagMaskControl,
+    "command": kCGEventFlagMaskCommand,
+    "shift": kCGEventFlagMaskShift,
 }
 
 _MODIFIER_NAMES = {
@@ -95,9 +106,23 @@ def _toggle_keycode_to_name(keycode):
     return _TOGGLE_KEY_NAMES.get(keycode, f"Key {keycode}")
 
 
-def _pin_keycode_to_name(keycode):
-    """置顶热键的显示名。"""
-    return PIN_KEY_NAMES.get(keycode, f"Key {keycode}")
+def _hotkey_to_name(keycode, modifiers):
+    """把「键码 + 修饰键」转成可显示的文字，例如 ⌥⇧P。
+
+    优先用 PIN_HOTKEYS 里的预置名；自定义组合则按修饰键顺序拼中文缩写。
+    """
+    for kc, mods, name in PIN_HOTKEYS:
+        if kc == keycode and list(mods) == list(modifiers):
+            return name
+
+    parts = []
+    for m in ("control", "alternate", "shift", "command"):
+        if m in modifiers:
+            parts.append({"control": "⌃", "alternate": "⌥", "shift": "⇧", "command": "⌘"}[m])
+    # 字母键码 → 字母。只覆盖常用几个，其余退化成键码显示。
+    letters = {35: "P", 36: "O", 17: "T", 15: "R", 0: "A", 1: "S", 2: "D", 3: "F"}
+    parts.append(letters.get(keycode, f"Key{keycode}"))
+    return "".join(parts)
 
 
 class OptSnapCore:
@@ -108,11 +133,21 @@ class OptSnapCore:
     """
 
     def __init__(self, modifier_name=None, toggle_keycode=None, on_state_change=None,
-                 pin_keycode=None):
+                 pin_hotkey=None):
         self.enabled = True
         self.modifier_mask = _MODIFIERS.get(modifier_name or MODIFIER_NAME, kCGEventFlagMaskAlternate)
         self.toggle_keycode = toggle_keycode or TOGGLE_KEYCODE
-        self.pin_keycode = pin_keycode or PIN_KEYCODE
+
+        # 置顶热键 = 字母键码 + 需要同时按住的修饰键集合。
+        # 用组合键而不是单按功能键：功能键在「媒体键模式」下发出的是
+        # NSSystemDefined 事件而非 keyDown，单键热键会收不到。
+        kc, mods = pin_hotkey or (PIN_HOTKEY_KEYCODE, PIN_HOTKEY_MODIFIERS)
+        self.pin_keycode = kc
+        self.pin_modifiers = list(mods)
+        self.pin_modifier_mask = 0
+        for m in self.pin_modifiers:
+            self.pin_modifier_mask |= _PIN_MODIFIER_FLAGS.get(m, 0)
+
         self.on_state_change = on_state_change  # callback for GUI refresh
 
         self.mode = "idle"
@@ -175,13 +210,22 @@ class OptSnapCore:
             self.on_state_change()
 
     def cycle_pin_key(self):
-        """轮换置顶热键。"""
+        """轮换置顶热键组合。"""
+        current = (self.pin_keycode, tuple(self.pin_modifiers))
+        options = [(kc, tuple(mods)) for kc, mods, _ in PIN_HOTKEYS]
         try:
-            idx = PIN_KEYCODES.index(self.pin_keycode)
+            idx = options.index(current)
         except ValueError:
             idx = -1
-        self.pin_keycode = PIN_KEYCODES[(idx + 1) % len(PIN_KEYCODES)]
-        logger.info(f"置顶热键改为 {_pin_keycode_to_name(self.pin_keycode)}")
+
+        kc, mods = options[(idx + 1) % len(options)]
+        self.pin_keycode = kc
+        self.pin_modifiers = list(mods)
+        self.pin_modifier_mask = 0
+        for m in mods:
+            self.pin_modifier_mask |= _PIN_MODIFIER_FLAGS.get(m, 0)
+
+        logger.info(f"置顶热键改为 {_hotkey_to_name(kc, mods)}")
         if self.on_state_change:
             self.on_state_change()
 
@@ -245,11 +289,27 @@ class OptSnapCore:
             if keycode == self.toggle_keycode:
                 self.toggle()
                 return None
-            # 置顶热键：即使 OptSnap 处于禁用状态也响应，
-            # 因为它和「全局开关」是并列的独立功能，不该被开关连坐。
+            # 置顶热键：组合键，必须「所有要求的修饰键都按住，且没有多余的」。
+            # 只判断 ≥ 会导致 ⌥⇧P 和 ⌥P 互相误触发；只判断 == 又会漏掉按住 CapsLock
+            # 这类无关状态位的情况，所以按位掩码精确比对。
             if keycode == self.pin_keycode:
-                self.toggle_pin_under_cursor()
-                return None
+                flags = CGEventGetFlags(event)
+                modifiers_now = flags & (
+                    kCGEventFlagMaskAlternate | kCGEventFlagMaskControl
+                    | kCGEventFlagMaskCommand | kCGEventFlagMaskShift
+                )
+                if modifiers_now == self.pin_modifier_mask:
+                    # 置顶和「全局开关」是并列功能，禁用状态下也响应
+                    logger.info(f"置顶热键命中（{_hotkey_to_name(self.pin_keycode, self.pin_modifiers)}）")
+                    result = self.toggle_pin_under_cursor()
+                    logger.info(f"置顶切换结果: {result}")
+                    return None
+                else:
+                    # 键对了但修饰键不匹配 —— 用 debug 级别记录，首次排查热键时有用
+                    logger.debug(
+                        f"置顶键 {keycode} 按下，但修饰键不匹配: "
+                        f"当前=0x{modifiers_now:x} 需要=0x{self.pin_modifier_mask:x}"
+                    )
 
         if not self.enabled:
             return event
