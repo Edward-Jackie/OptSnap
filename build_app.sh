@@ -95,11 +95,19 @@ PYEOF
 # Create PkgInfo
 echo -n "APPL????" > "${CONTENTS}/PkgInfo"
 
-# Create shell launcher (use absolute path)
-RESOURCES_ABS="$(cd "${RESOURCES}" && pwd)"
+# Create shell launcher
+#
+# 路径必须相对 .app 自身解析，不能硬编码 build/ 的绝对路径：否则把这个 .app 复制到
+# /Applications 之后，它仍然去跑 build/ 里那份 __boot__.py —— 用户以为装的是新版本，
+# 实际运行的却是别处的旧代码（真实踩过）。
+#
+# 只有 venv 的 python 是项目内的绝对路径（这个 app 依赖项目 venv，不做独立分发）。
 cat > "${MACOS}/OptSnap" << SHEOF
 #!/bin/bash
-exec "${VENV_PYTHON}" "${RESOURCES_ABS}/__boot__.py"
+# 解析出 .app 自身所在位置：本脚本在 <app>/Contents/MacOS/ 下
+SELF_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
+CONTENTS_DIR="\$(dirname "\${SELF_DIR}")"
+exec "${VENV_PYTHON}" "\${CONTENTS_DIR}/Resources/__boot__.py"
 SHEOF
 
 chmod +x "${MACOS}/OptSnap"
