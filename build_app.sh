@@ -57,6 +57,11 @@ if [ -f "${PROJECT_DIR}/assets/icon.icns" ]; then
     cp "${PROJECT_DIR}/assets/icon.icns" "${RESOURCES}/icon.icns"
 fi
 
+# Copy menubar icon (template image, all scales)
+for f in "${PROJECT_DIR}/src/optsnap/resources"/menubar_icon*.png; do
+    [ -f "$f" ] && cp "$f" "${RESOURCES}/"
+done
+
 # Create Python launcher
 VENV_PYTHON="${PROJECT_DIR}/.venv/bin/python3"
 
