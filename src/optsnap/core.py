@@ -164,6 +164,9 @@ class OptSnapCore:
 
         self._running = False
         self._thread = None
+        # shutdown() 的幂等标记：退出路径有多条（菜单、信号、atexit），
+        # 每条都可能调一次 shutdown，必须保证清理只执行一遍
+        self._shutting_down = False
 
     # ── Public API for GUI ─────────────────────────────────────────────
 
@@ -452,8 +455,14 @@ class OptSnapCore:
             self._event_tap = None
 
         reset_all_alpha()
-        # 退出/停止时统一清掉置顶，别让用户的窗口留在浮动层回不去
-        pin.reset_all_pins()
+        # 这里不调 pin.reset_all_pins()：置顶还原统一放在 shutdown() 里，
+        # 因为它需要「通道还活着」才能生效，而 _stop_tap 之后通道命令仍可发，
+        # 但顺序上先还原再停 tap 更稳妥。此处只做描边兜底清理。
+        try:
+            from optsnap import border
+            border.remove_all_borders()
+        except Exception as e:
+            logger.debug(f"清除描边失败: {e}")
         logger.info("OptSnap tap stopped")
 
     # ── Run / Stop ────────────────────────────────────────────────────
@@ -463,15 +472,9 @@ class OptSnapCore:
         if not self._start_tap():
             return
 
-        def _signal_handler(sig, frame):
-            self.stop()
-
-        # Only set signal handlers in main thread
-        import threading
-        if threading.current_thread() is threading.main_thread():
-            signal.signal(signal.SIGINT, _signal_handler)
-            signal.signal(signal.SIGTERM, _signal_handler)
-
+        # 信号处理器只在主线程注册（Python 限制），这里通常跑在后台线程，
+        # 所以实际注册工作放在 __main__.py:main() 里做。此处保留仅为直接调用 run()
+        # 的场景（比如测试脚本），不要依赖它处理退出。
         self._running = True
         try:
             CFRunLoopRun()
@@ -480,6 +483,54 @@ class OptSnapCore:
         finally:
             self._stop_tap()
             self._running = False
+
+    def install_signal_handlers(self):
+        """在主线程安装退出信号处理器。
+
+        必须在 main() 里、且在 run_in_thread() 之前调用 —— signal.signal 只能从
+        主线程调用，而 core 的事件循环跑在后台线程里，在那边注册会被直接跳过。
+        """
+        import threading
+        if threading.current_thread() is not threading.main_thread():
+            logger.debug("非主线程，跳过信号处理器注册")
+            return False
+
+        def _handler(sig, frame):
+            logger.info(f"收到信号 {sig}，开始清理退出")
+            self.shutdown()
+
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            try:
+                signal.signal(sig, _handler)
+            except (ValueError, OSError) as e:
+                logger.debug(f"注册信号 {sig} 失败: {e}")
+        return True
+
+    def shutdown(self):
+        """完整的退出清理：还原置顶 → 停止事件循环。
+
+        幂等：重复调用只生效一次。退出路径有多条（菜单退出、SIGINT、SIGTERM、
+        atexit），任何一条都可能触发，必须保证清理逻辑不会重复执行或互相干扰。
+        """
+        if getattr(self, "_shutting_down", False):
+            return
+        self._shutting_down = True
+
+        logger.info("OptSnap 正在退出…")
+
+        # 还原置顶必须放在停止事件循环之前：还原靠写命令文件 + 等回执，
+        # 通道还活着才能生效。
+        try:
+            ok = pin.reset_all_pins(verify=True)
+            if not ok:
+                logger.warning("退出时未能还原全部置顶窗口，请手动检查")
+        except Exception as e:
+            logger.error(f"退出时还原置顶失败: {e}")
+
+        try:
+            self.stop()
+        except Exception as e:
+            logger.error(f"停止事件循环失败: {e}")
 
     def run_in_thread(self):
         """Start the event loop in a background thread."""

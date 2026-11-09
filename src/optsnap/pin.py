@@ -45,9 +45,21 @@ PIN_LEVEL_NORMAL = 0
 
 _lock = threading.Lock()
 _channel_ready = False
-_cmd_seq = int(time.time()) % 1000000
+# 命令序号。载荷那边会记住「已处理的最大序号」，只执行更大的序号，避免重复执行。
+#
+# 关键：**必须单调递增且比上次运行大**。用时间戳取模初始化是错的 —— 重启后算出的
+# 序号可能比载荷记住的小（实测踩到：载荷 last_seq=205780，新进程从 205767 开始，
+# 所有命令都被当成「已处理」跳过，置顶和还原全部静默失效）。
+# 用毫秒时间戳做起点，正常情况下每次重启都会更大。
+_cmd_seq = int(time.time() * 1000)
 # window_id -> 当前是否置顶
 _pinned_state = {}
+
+# 启动清扫用的互斥锁 + 完成标记。
+# 清扫是后台线程跑的（注入要 10-15 秒），如果不等它完成就让用户操作，
+# 会出现「用户刚置顶的窗口被清扫逻辑当成遗留残留清掉」的问题。
+_startup_lock = threading.Lock()
+_startup_done = False
 
 
 def is_supported():
@@ -204,12 +216,42 @@ def ensure_channel(wait=True, timeout=20.0):
         if _heartbeat_alive():
             with _lock:
                 _channel_ready = True
+            # 通道就绪后立刻对齐序号：载荷可能比本进程活得久，记着更大的序号，
+            # 不同步的话后面所有命令都会被它当成「已处理」跳过。
+            _sync_cmd_seq()
             logger.info(f"置顶通道就绪（耗时 {time.time() - started:.1f}s）")
             return True
         time.sleep(0.2)
 
     logger.error("置顶通道注入后未检测到心跳")
     return False
+
+
+def _sync_cmd_seq():
+    """把 _cmd_seq 抬到「比载荷已处理的序号更大」的位置。
+
+    载荷进程可能比本进程活得久（Dock 不重启时，注入的线程一直在跑），它记着上次
+    处理过的最大序号。如果本进程重启后序号从头开始，载荷会把新命令全部当成
+    「已处理」跳过 —— 表现就是置顶和还原静默失效（实测踩过）。
+
+    这里读回执文件里的序号做下限，保证新序号一定更大。
+    """
+    global _cmd_seq
+
+    used = 0
+    for path in (ACK_FILE, CMD_FILE):
+        try:
+            with open(path) as f:
+                parts = f.read().split()
+            if parts:
+                used = max(used, int(parts[0]))
+        except (OSError, ValueError):
+            pass
+
+    with _lock:
+        if used >= _cmd_seq:
+            _cmd_seq = used
+            logger.debug(f"命令序号已同步到载荷当前进度: {used}")
 
 
 def _send_command(window_id, level):
@@ -220,7 +262,29 @@ def _send_command(window_id, level):
     global _cmd_seq
 
     with _lock:
-        _cmd_seq += 1
+        # 每次发命令前先对齐载荷进度：读回执里最后处理过的序号作为下限。
+        #
+        # 为什么必须每次查而不是只在启动时查一次：可能有多个进程同时用这个通道
+        # （比如主程序 + 调试脚本），各自维护自己的计数器。谁写回执谁就把进度推高了，
+        # 另一个进程的计数器可能落后 —— 落后时载荷会把它发的命令当成「已处理」跳过，
+        # 表现是命令静默失效（实测踩过：退出还原命令全部超时，窗口停在浮层）。
+        used = 0
+        try:
+            with open(ACK_FILE) as f:
+                parts = f.read().split()
+            if parts:
+                used = int(parts[0])
+        except (OSError, ValueError):
+            pass
+
+        if used >= _cmd_seq:
+            _cmd_seq = used
+            logger.debug(f"命令序号对齐到载荷进度: {used}")
+
+        # 用「毫秒时间戳」和「自增」取较大者。两个进程同时发命令时，
+        # 各自读到同一个回执号会算出相同序号，用时间戳能进一步降低撞号概率；
+        # 即使撞了，载荷按 `seq > last_seq` 判断，后到的会被丢弃 —— 不会互相破坏。
+        _cmd_seq = max(_cmd_seq + 1, int(time.time() * 1000))
         seq = _cmd_seq
 
     try:
@@ -261,6 +325,13 @@ def set_pinned(window_id, pinned):
     if not _heartbeat_alive():
         logger.warning("置顶通道未就绪，忽略本次切换")
         return False
+
+    # 等启动清扫结束再动手。清扫要处理「上次崩溃留下的置顶窗口」，
+    # 如果这时用户抢先置顶了一个窗口，清扫会把它当成残留一起还原掉。
+    global _startup_done
+    if not _startup_done:
+        with _startup_lock:
+            pass  # 拿到锁即表示清扫已完成（或已跳过）
 
     level = PIN_LEVEL_FLOATING if pinned else PIN_LEVEL_NORMAL
     ok, err = _send_command(window_id, level)
@@ -317,24 +388,125 @@ def is_pinned_any():
     return bool(_pinned_state)
 
 
+def find_actually_pinned():
+    """扫描系统里真实处于置顶层级的所有应用窗口。
+
+    这是退出还原的兜底手段。光靠 _pinned_state 不够：程序异常退出、Dock 重启导致
+    状态丢失、或用户手动改过层级时，内存状态会和实际不一致。以窗口层级为准最可靠。
+
+    判断范围刻意收紧到 (PIN_LEVEL_NORMAL, PIN_LEVEL_FLOATING]，**不能**宽泛地用
+    「不等于 0」—— 系统 UI 的层级是负的特殊值（桌面 -2147483603、程序坞
+    -2147483624），菜单栏是 24、程序坞是 20，误改这些会破坏系统界面。
+    """
+    import os
+    from Quartz import CGWindowListCopyWindowInfo, kCGWindowListOptionOnScreenOnly, kCGNullWindowID
+
+    own_pid = os.getpid()
+    found = []
+    try:
+        for info in CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID):
+            if info.get('kCGWindowOwnerPID') == own_pid:
+                continue
+            level = info.get('kCGWindowLayer', 0)
+            if PIN_LEVEL_NORMAL < level <= PIN_LEVEL_FLOATING:
+                found.append(info.get('kCGWindowNumber'))
+    except Exception as e:
+        logger.debug(f"扫描置顶窗口失败: {e}")
+    return found
+
+
 def pinned_count():
     return len(_pinned_state)
 
 
-def reset_all_pins():
-    """取消所有置顶（禁用/退出时调用），避免窗口卡在浮动层。"""
-    if not _pinned_state:
-        _clear_borders()
-        return
-    if not _heartbeat_alive():
+def reset_all_pins(verify=True):
+    """取消所有置顶（禁用/退出时调用），避免窗口卡在浮动层。
+
+    清理范围取两个来源的并集，缺一不可：
+    - 内存里的 _pinned_state：记录我们主动置顶过的窗口
+    - find_actually_pinned()：扫描系统里真实处于浮层级的窗口，兜住状态丢失的情况
+
+    verify=True 时在还原后再扫一遍，把漏掉的补一次。退出流程用这个，宁可多试一轮。
+
+    返回是否全部还原干净（True/False），调用方可以据此决定是否记录警告。
+    """
+    targets = set(_pinned_state.keys())
+    targets |= set(find_actually_pinned())
+
+    if not targets:
         _pinned_state.clear()
         _clear_borders()
-        return
-    for window_id in list(_pinned_state.keys()):
+        return True
+
+    logger.info(f"正在还原 {len(targets)} 个窗口的置顶状态")
+
+    if not _heartbeat_alive():
+        # 通道已死（Dock 重启等），发命令没用。清掉内存状态和描边即可 ——
+        # 窗口层级此时通常已随 Dock 重启重置，不需要也无法恢复。
+        logger.warning("置顶通道不可用，跳过层级还原（窗口层级会随 Dock 重启复位）")
+        _pinned_state.clear()
+        _clear_borders()
+        return True
+
+    for window_id in targets:
         _send_command(window_id, PIN_LEVEL_NORMAL)
+
     _pinned_state.clear()
     _clear_borders()
-    logger.info("已取消所有窗口置顶")
+
+    if verify:
+        # 再扫一次，补掉可能漏掉/失败的。只补一轮：某些窗口（全屏、系统保护窗口）
+        # 的层级本来就改不动，无限重试只会拖慢退出流程，不如明确报出来。
+        leftover = find_actually_pinned()
+        if leftover:
+            logger.info(f"复查发现 {len(leftover)} 个窗口仍在浮层，补一次还原")
+            for window_id in leftover:
+                _send_command(window_id, PIN_LEVEL_NORMAL)
+            leftover = find_actually_pinned()
+
+        if leftover:
+            logger.warning(
+                f"仍有 {len(leftover)} 个窗口未能还原: {leftover}"
+                "（可能是全屏或系统保护窗口，无法修改层级）"
+            )
+            return False
+
+    logger.info("已还原所有窗口置顶状态")
+    return True
+
+
+def startup_cleanup(timeout=60):
+    """启动时清扫上次异常退出留下的置顶窗口。
+
+    进程被 SIGKILL 时任何 Python 清理代码都跑不了（操作系统层面的限制），
+    所以这是唯一的兜底手段。靠扫描窗口层级而不是内存状态 —— 崩溃后状态已经丢了。
+
+    关键点：清扫必须在用户能操作之前完成，否则会把用户刚置顶的窗口也清掉。
+    这里用 _startup_lock 和 set_pinned 互斥，并且清扫期间 set_pinned 会等待。
+    """
+    global _startup_done
+
+    try:
+        if not ensure_channel(wait=True, timeout=timeout):
+            logger.debug("启动清扫跳过：置顶通道不可用")
+            with _startup_lock:
+                _startup_done = True
+            return
+
+        # 清扫期间挡住新的置顶操作，避免「刚置顶就被清掉」
+        with _startup_lock:
+            leftover = find_actually_pinned()
+            if leftover:
+                logger.info(f"发现 {len(leftover)} 个上次遗留的置顶窗口，正在还原")
+                for window_id in leftover:
+                    _send_command(window_id, PIN_LEVEL_NORMAL)
+                _pinned_state.clear()
+                _clear_borders()
+            _startup_done = True
+    except Exception as e:
+        logger.warning(f"启动清扫失败: {e}")
+        with _startup_lock:
+            _startup_done = True
 
 
 def _clear_borders():

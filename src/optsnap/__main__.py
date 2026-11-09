@@ -299,9 +299,48 @@ class OptSnapMenuApp(rumps.App):
         self._build_menu()
 
     def _quit(self, sender):
-        logger.info("用户请求退出 — 终止进程")
-        self.core.stop()
+        logger.info("用户请求退出 — 清理后终止进程")
+        self.core.shutdown()
         sys.exit(0)
+
+
+def _install_cocoa_terminate_hook(core):
+    """注册 Cocoa 的退出通知，保证退出前还原置顶窗口。
+
+    为什么不能用 Python 的 signal：
+    rumps 的 run() 最终调用 AppHelper.runEventLoop()，这是 Cocoa 的 C 语言级
+    event loop，**Python 的信号处理器在里面永远得不到执行机会**。实测 SIGTERM
+    发送后进程既不退出也不触发关闭逻辑。
+
+    NSApplicationWillTerminateNotification 是 AppKit 自己的退出钩子，无论用户从
+    菜单退出、Dock 右键退出还是系统注销/关机都会触发，是这里唯一可靠的接入点。
+    """
+    try:
+        from Foundation import NSNotificationCenter, NSObject
+        import AppKit
+
+        class _TerminateObserver(NSObject):
+            def handleTerminate_(self, notification):
+                logger.info("收到系统退出通知，开始清理")
+                try:
+                    core.shutdown()
+                except Exception as e:
+                    logger.error(f"退出清理失败: {e}")
+
+        observer = _TerminateObserver.alloc().init()
+        NSNotificationCenter.defaultCenter().addObserver_selector_name_object_(
+            observer,
+            "handleTerminate:",
+            AppKit.NSApplicationWillTerminateNotification,
+            None,
+        )
+        # 必须持有引用，否则 observer 被 Python 回收后通知就断了
+        core._terminate_observer = observer
+        logger.debug("已注册 Cocoa 退出钩子")
+        return True
+    except Exception as e:
+        logger.warning(f"注册退出钩子失败（退出时可能不会还原置顶）: {e}")
+        return False
 
 
 def main():
@@ -311,10 +350,23 @@ def main():
     core = OptSnapCore()
 
     def _cleanup():
-        logger.info("清理：停止核心")
-        core.stop()
+        # atexit 兜住所有「没走正常退出路径」的情况（未捕获异常、sys.exit 等）。
+        # shutdown() 是幂等的，正常退出时这里基本是空转。
+        try:
+            core.shutdown()
+        except Exception as e:
+            logger.error(f"退出清理失败: {e}")
 
     atexit.register(_cleanup)
+
+    # 信号处理器必须在主线程注册，且要在事件循环跑到后台线程之前。
+    # 否则 Ctrl+C / kill 不会走清理流程，置顶的窗口会留在浮层上。
+    # 两套退出钩子都要装，覆盖不同场景：
+    # - Cocoa 通知：用户在菜单/Dock 退出、系统注销关机（主路径）
+    # - 信号处理器：终端里 Ctrl+C / kill（rumps 的 C 循环里不生效，但装了无害，
+    #   且在不经过 rumps 的测试脚本里仍然有用）
+    _install_cocoa_terminate_hook(core)
+    core.install_signal_handlers()
 
     has_ax, has_input = core.check_permissions()
 
@@ -349,10 +401,10 @@ def main():
 
     core.run_in_thread()
 
-    # 置顶通道在后台预热：注入要 10-15 秒，放主线程会卡住菜单栏。
-    # 失败也不影响其它功能，菜单里会显示原因和引导。
+    # 置顶通道在后台预热 + 启动清扫：注入要 10-15 秒，放主线程会卡住菜单栏。
+    # 清扫逻辑在 pin.startup_cleanup 里和用户操作做了互斥，不会误清用户新置顶的窗口。
     if pin.is_supported():
-        threading.Thread(target=pin.ensure_channel, kwargs={"wait": True}, daemon=True).start()
+        threading.Thread(target=pin.startup_cleanup, daemon=True).start()
 
     print("[OptSnap] 菜单栏已启动。点击图标进行设置。")
     OptSnapMenuApp(core).run()
