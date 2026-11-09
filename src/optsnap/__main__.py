@@ -21,7 +21,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-_MENUBAR_ICON = os.path.join(os.path.dirname(__file__), "resources", "menubar_icon.png")
+_RESOURCES = os.path.join(os.path.dirname(__file__), "resources")
+_MENUBAR_ICON = os.path.join(_RESOURCES, "menubar_icon.png")
+
+
+def _load_menubar_icon():
+    """返回菜单栏图标文件路径，供 rumps 加载。
+
+    注意 rumps 的 icon 参数只接受**文件路径**，传 NSImage 会抛 TypeError。
+    模板模式（深色菜单栏自动反相）由 rumps 的 template 参数负责，不在外面设。
+
+    多分辨率：rumps 内部走 _nsimage_from_file，只读指定的那一个文件。这里优先返回
+    带 @2x 的版本（Retina 屏是当前主流），保证不会因为用 22px 拉伸而发虚。
+    """
+    for name in ("menubar_icon@2x.png", "menubar_icon.png"):
+        path = os.path.join(_RESOURCES, name)
+        if os.path.exists(path):
+            return path
+    return None
 
 
 def _sf_icon(name):
@@ -41,10 +58,14 @@ class OptSnapMenuApp(rumps.App):
     def __init__(self, core):
         self.core = core
         core.on_state_change = self._refresh_menu
+        _icon = _load_menubar_icon()
         super().__init__(
             name="OptSnap",
-            icon=_MENUBAR_ICON if os.path.exists(_MENUBAR_ICON) else None,
-            title=None if os.path.exists(_MENUBAR_ICON) else "⬡",
+            icon=_icon,
+            # 图标加载不出来才退回文字，避免菜单栏位置空掉看不出来
+            title=None if _icon is not None else "⬡",
+            # 模板模式：让系统按明暗菜单栏自动反相，深色模式下才不会是一片黑
+            template=True,
             # rumps 默认在 .run() 时插入一次自带退出项；我们每次状态变化都重
             # 建整个菜单（见 _build_menu），自己持有退出项，置 None 避免重复插入报错。
             quit_button=None,
