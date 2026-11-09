@@ -426,6 +426,187 @@ def test_permissions_missing_for_pin():
     print("  permissions 缺失项判断: PASS")
 
 
+
+
+def test_shutdown_is_idempotent():
+    """shutdown() 必须幂等：菜单退出、信号、atexit 可能各调一次，
+    清理逻辑绝不能重复执行（会重复发命令、重复关面板）。"""
+    from optsnap.core import OptSnapCore
+
+    core = OptSnapCore()
+    calls = []
+
+    with patch('optsnap.pin.reset_all_pins', side_effect=lambda **kw: calls.append(1) or True), \
+         patch.object(core, 'stop'):
+
+        core.shutdown()
+        core.shutdown()
+        core.shutdown()
+
+    assert len(calls) == 1, f"reset_all_pins 被调用了 {len(calls)} 次，应为 1"
+    print("  shutdown 幂等: PASS")
+
+
+def test_shutdown_restores_before_stop():
+    """shutdown 必须先还原置顶再停事件循环。
+
+    还原靠写命令文件 + 等回执，通道得活着才有效。顺序反了会还原失败。
+    """
+    from optsnap.core import OptSnapCore
+
+    core = OptSnapCore()
+    order = []
+
+    with patch('optsnap.pin.reset_all_pins', side_effect=lambda **kw: order.append('reset') or True), \
+         patch.object(core, 'stop', side_effect=lambda: order.append('stop')):
+
+        core.shutdown()
+
+    assert order == ['reset', 'stop'], f"执行顺序错误: {order}"
+    print("  shutdown 顺序（先还原后停止）: PASS")
+
+
+def test_shutdown_survives_reset_failure():
+    """还原失败不能让 shutdown 崩掉——必须继续停掉事件循环。"""
+    from optsnap.core import OptSnapCore
+
+    core = OptSnapCore()
+    stopped = []
+
+    with patch('optsnap.pin.reset_all_pins', side_effect=RuntimeError("boom")), \
+         patch.object(core, 'stop', side_effect=lambda: stopped.append(1)):
+
+        core.shutdown()
+
+    assert stopped, "还原抛异常后没有继续停止事件循环"
+    print("  shutdown 容错: PASS")
+
+
+def test_find_actually_pinned_ignores_system_windows():
+    """兜底扫描必须只认浮层范围，不能碰系统窗口。
+
+    这是之前踩过的真实坑：用「层级 != 0」判断会把桌面（-2147483603）、
+    程序坞（-2147483624）、菜单栏（24）也当成置顶窗口去还原，破坏系统界面。
+    """
+    from optsnap import pin
+    import os
+
+    fake_windows = [
+        {'kCGWindowNumber': 1, 'kCGWindowOwnerPID': 9001, 'kCGWindowLayer': 3},
+        {'kCGWindowNumber': 2, 'kCGWindowOwnerPID': 9001, 'kCGWindowLayer': 0},
+        {'kCGWindowNumber': 3, 'kCGWindowOwnerPID': 9001, 'kCGWindowLayer': 20},
+        {'kCGWindowNumber': 4, 'kCGWindowOwnerPID': 9001, 'kCGWindowLayer': 24},
+        {'kCGWindowNumber': 5, 'kCGWindowOwnerPID': 9001, 'kCGWindowLayer': -2147483603},
+        {'kCGWindowNumber': 6, 'kCGWindowOwnerPID': 9001, 'kCGWindowLayer': -2147483624},
+        {'kCGWindowNumber': 7, 'kCGWindowOwnerPID': os.getpid(), 'kCGWindowLayer': 3},
+    ]
+
+    with patch('Quartz.CGWindowListCopyWindowInfo', return_value=fake_windows):
+        found = pin.find_actually_pinned()
+
+    assert found == [1], f"扫描结果错误，只应命中浮层窗口 1，实际 {found}"
+    print("  find_actually_pinned 不误伤系统窗口: PASS")
+
+
+def test_reset_all_pins_uses_scan_fallback():
+    """reset_all_pins 必须合并「内存状态」和「扫描结果」。
+
+    只靠内存状态的话，崩溃/状态丢失后残留窗口永远清不掉。
+    """
+    from optsnap import pin
+
+    pin._pinned_state = {100: True}
+    sent = []
+
+    with patch('optsnap.pin._heartbeat_alive', return_value=True), \
+         patch('optsnap.pin.find_actually_pinned', return_value=[200]), \
+         patch('optsnap.pin._send_command', side_effect=lambda w, l: sent.append(w) or (True, 0)), \
+         patch('optsnap.pin._clear_borders'):
+
+        pin.reset_all_pins(verify=False)
+
+    assert set(sent) == {100, 200}, f"应同时还原内存和扫描到的窗口，实际 {sent}"
+    print("  reset_all_pins 合并双来源: PASS")
+
+
+def test_reset_all_pins_reports_failure():
+    """有窗口还原不掉时要返回 False，让调用方记录警告，而不是假装成功。"""
+    from optsnap import pin
+
+    pin._pinned_state = {}
+    # 扫描第一次返回残留，还原后仍然返回残留 → 应报失败
+    with patch('optsnap.pin._heartbeat_alive', return_value=True), \
+         patch('optsnap.pin.find_actually_pinned', return_value=[300]), \
+         patch('optsnap.pin._send_command', return_value=(True, 0)), \
+         patch('optsnap.pin._clear_borders'):
+
+        ok = pin.reset_all_pins(verify=True)
+
+    assert ok is False, "还原不掉时应返回 False"
+    print("  reset_all_pins 失败上报: PASS")
+
+
+
+
+def test_startup_cleanup_blocks_concurrent_pin():
+    """启动清扫期间，用户的置顶操作必须等待，不能被当成残留清掉。
+
+    这是实测发现的真实竞争：清扫是后台线程跑的（注入要 10-15 秒），
+    如果用户在清扫完成前置顶窗口，清扫会把它一起还原掉。
+    """
+    from optsnap import pin
+    import threading
+    import time
+
+    pin._pinned_state = {}
+    pin._startup_done = False
+
+    order = []
+
+    # 模拟清扫持锁一段时间
+    def fake_cleanup():
+        with pin._startup_lock:
+            order.append('cleanup_start')
+            time.sleep(0.3)
+            order.append('cleanup_end')
+            pin._startup_done = True
+
+    t = threading.Thread(target=fake_cleanup)
+    t.start()
+    time.sleep(0.05)   # 确保清扫先拿到锁
+
+    with patch('optsnap.pin._heartbeat_alive', return_value=True), \
+         patch('optsnap.pin._send_command', return_value=(True, 0)), \
+         patch('optsnap.border.set_border'):
+        # 这个 set_pinned 应该等清扫结束才执行
+        pin.set_pinned(555, True)
+        order.append('pin')
+
+    t.join()
+    assert order.index('cleanup_end') < order.index('pin'), f"置顶操作没等清扫完成: {order}"
+    print("  startup_cleanup 与置顶互斥: PASS")
+
+
+def test_startup_cleanup_restores_leftover():
+    """启动清扫要能还原崩溃残留（靠扫描层级，不靠内存状态）。"""
+    from optsnap import pin
+
+    pin._pinned_state = {}   # 内存状态是空的（模拟崩溃后重启）
+    pin._startup_done = False
+    sent = []
+
+    with patch('optsnap.pin.ensure_channel', return_value=True), \
+         patch('optsnap.pin.find_actually_pinned', side_effect=[[700, 800], []]), \
+         patch('optsnap.pin._send_command', side_effect=lambda w, l: sent.append(w) or (True, 0)), \
+         patch('optsnap.pin._clear_borders'):
+
+        pin.startup_cleanup()
+
+    assert set(sent) == {700, 800}, f"未清除内存外的残留: {sent}"
+    assert pin._startup_done is True
+    print("  startup_cleanup 清扫残留: PASS")
+
+
 def main():
     print("OptSnap 置顶逻辑测试")
     print("=" * 40)
@@ -450,6 +631,14 @@ def main():
         test_border_level_above_pinned_window,
         test_set_pinned_controls_border,
         test_reset_all_pins_clears_borders,
+        test_startup_cleanup_blocks_concurrent_pin,
+        test_startup_cleanup_restores_leftover,
+        test_shutdown_is_idempotent,
+        test_shutdown_restores_before_stop,
+        test_shutdown_survives_reset_failure,
+        test_find_actually_pinned_ignores_system_windows,
+        test_reset_all_pins_uses_scan_fallback,
+        test_reset_all_pins_reports_failure,
         test_permissions_missing_for_pin,
     ]
 
