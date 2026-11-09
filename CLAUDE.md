@@ -147,3 +147,55 @@ restarting OptSnap, there's no live-reload.
 `permissions.py` 只做检测 + 跳转，不强行拦启动。`missing_for_pin()` 的默认缺失列表
 **不含开发者模式**——实测本机 `DevToolsSecurity -status` 显示 disabled 时注入依然成功，
 它是排查项不是硬门槛（`pin_troubleshooting_hint()` 里才提）。
+
+## 置顶窗口的描边标记（border.py）
+
+`border.py` 给每个置顶窗口叠一个无边框、点击穿透的 NSPanel，layer 只画一圈 1.5pt 边框。
+
+### 层级选择（不要随意调高）
+
+`BORDER_LEVEL = 4`，刚好比 `PIN_LEVEL_FLOATING = 3` 高一级。**不要**为了「更保险」把它
+设到 20 以上：高于程序坞（20）或菜单栏（24）的浮层会盖住系统 UI，看起来像 bug。
+`test_pin.py:test_border_level_above_pinned_window` 锁住了这个约束。
+
+### 位置跟随
+
+OptSnap 已经拦下了拖拽事件，但置顶窗口也可能被别的程序移动（动画、脚本、系统重排），
+靠事件推断位置不可靠。所以用 `NSTimer` 按 60fps 整表刷新一次 `CGWindowList` —— 一次调用
+拿全部窗口几何，比每个窗口单独查便宜得多。定时器只在有描边时运行，空闲时会停掉。
+
+定时器必须加入 `NSRunLoopCommonModes`，否则菜单弹出、窗口拖动等 tracking 模式下不触发，
+描边会明显滞后。
+
+### 坐标换算
+
+CG 全局坐标以**主屏左上角**为原点、y 向下；AppKit 以**主屏左下角**为原点、y 向上。
+换算是 `ns_y = 主屏高度 - cg_y - 窗口高度`，对副屏同样成立（副屏的 x 为负，y 原样翻）。
+`test_pin.py:test_border_coordinate_conversion` 覆盖了这个计算。
+
+### 失败不能影响置顶
+
+描边只是视觉标记。`pin.py:set_pinned()` 里描边调用包在 try/except 里，描边挂了
+置顶本身仍然返回成功 —— 否则用户会遇到「明明置顶了却报失败」。
+
+## 图标资源（scripts/make_icon.py / make_menubar_icon.py）
+
+图标由脚本生成，不要手改 PNG。两套图标的规范完全不同，混用会出问题：
+
+| 类型 | 规范 | 生成脚本 |
+| --- | --- | --- |
+| app 图标 | 1024 画布、圆角矩形主体、彩色、四周留白 9.8%、圆角占主体 22.4% | `make_icon.py` |
+| 菜单栏图标 | 22pt（@1x/@2x/@3x）、**纯黑 + 透明背景的模板图** | `make_menubar_icon.py` |
+
+app 图标的比例是从系统自带 `AppIcon.icns`（Calculator）实测反推出来的，不是猜的。
+
+### 菜单栏图标的两个坑
+
+1. **必须是纯黑 + 透明背景**。模板图只有 alpha 有意义，颜色由系统按明暗菜单栏决定。
+   用彩色或不透明底图会导致深色菜单栏上显示成一坨方块。
+2. **`rumps` 的 `icon` 参数只接受文件路径**，传 `NSImage` 会抛
+   `TypeError: expected str, bytes or os.PathLike object, not NSImage`。模板模式用
+   `template=True` 参数交给 rumps 处理，不要在外面自己 `setTemplate_`。
+
+菜单栏图形选的是「单窗口 + 向上箭头」而不是像 app 图标那样三层叠放：22pt 下三层
+会糊成一团（实测 stroke 挤在一起分不出层次）。

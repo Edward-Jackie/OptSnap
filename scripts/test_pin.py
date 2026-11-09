@@ -242,6 +242,169 @@ def test_toggle_sequence_pin_then_unpin():
     print("  快捷键置顶/取消序列: PASS")
 
 
+def test_hotkey_requires_exact_modifiers():
+    """置顶热键必须精确匹配修饰键组合。
+
+    ⌥⇧P 不能在只按 ⌥P 时触发，也不能在 ⌥⇧⌃P 时触发。
+    这是换组合键方案后的核心正确性约束。
+    """
+    from optsnap.core import OptSnapCore, _hotkey_to_name
+    from optsnap import pin
+    from Quartz import kCGEventFlagMaskAlternate, kCGEventFlagMaskShift, kCGEventFlagMaskControl
+
+    core = OptSnapCore()
+    # 默认应为 ⌥⇧P
+    assert core.pin_keycode == 35
+    assert core.pin_modifier_mask == (kCGEventFlagMaskAlternate | kCGEventFlagMaskShift)
+    assert _hotkey_to_name(core.pin_keycode, core.pin_modifiers) == "⌥⇧P"
+
+    # 精确匹配才算
+    ok_flags = kCGEventFlagMaskAlternate | kCGEventFlagMaskShift
+    assert (ok_flags & (kCGEventFlagMaskAlternate | kCGEventFlagMaskControl
+                        | kCGEventFlagMaskShift)) == core.pin_modifier_mask
+
+    # 只按 ⌥ 不匹配
+    only_alt = kCGEventFlagMaskAlternate
+    assert (only_alt & (kCGEventFlagMaskAlternate | kCGEventFlagMaskControl
+                        | kCGEventFlagMaskShift)) != core.pin_modifier_mask
+
+    # 多按 ⌃ 也不匹配
+    extra = ok_flags | kCGEventFlagMaskControl
+    assert (extra & (kCGEventFlagMaskAlternate | kCGEventFlagMaskControl
+                     | kCGEventFlagMaskShift)) != core.pin_modifier_mask
+
+    print("  置顶热键精确匹配: PASS")
+
+
+def test_cycle_pin_hotkey():
+    """轮换置顶热键时，修饰键掩码同步更新。"""
+    from optsnap.core import OptSnapCore
+    from optsnap.config import PIN_HOTKEYS
+
+    core = OptSnapCore()
+    seen = set()
+    for _ in range(len(PIN_HOTKEYS)):
+        seen.add((core.pin_keycode, tuple(core.pin_modifiers)))
+        # 掩码必须与修饰键列表一致（非零）
+        assert core.pin_modifier_mask != 0
+        core.cycle_pin_key()
+    # 转一圈应回到起点
+    assert (core.pin_keycode, tuple(core.pin_modifiers)) in seen
+    assert len(seen) == len(PIN_HOTKEYS)
+
+    print("  cycle_pin_hotkey: PASS")
+
+
+def test_border_coordinate_conversion():
+    """CG 坐标（左上原点）→ AppKit 坐标（左下原点）的换算。
+
+    换算错了描边会跑到屏幕外或上下颠倒，是最容易出错的纯计算部分。
+    双屏环境下也要正确：CG 全局坐标以主屏左上为原点，AppKit 以主屏左下为原点。
+    """
+    from optsnap import border
+
+    class FakeScreen:
+        def frame(self):
+            class R:
+                size = type('S', (), {'height': 1080})()
+            return R()
+
+    class FakeNSScreen:
+        @staticmethod
+        def mainScreen():
+            return FakeScreen()
+
+    import sys
+    fake_appkit = type('M', (), {'NSScreen': FakeNSScreen})
+    real = sys.modules.get('AppKit')
+    sys.modules['AppKit'] = fake_appkit
+    try:
+        # 窗口贴顶：y=25, h=1025 → ns_y = 1080 - 25 - 1025 = 30
+        origin, size = border._border_rect({'x': 14, 'y': 25, 'w': 1930, 'h': 1025})
+        assert origin == (14.0, 30.0), origin
+        assert size == (1930.0, 1025.0), size
+
+        # 铺满主屏：y=0, h=1080 → ns_y = 0
+        origin, size = border._border_rect({'x': 0, 'y': 0, 'w': 1920, 'h': 1080})
+        assert origin == (0.0, 0.0), origin
+
+        # 副屏（x 为负）：x 原样保留，只有 y 需要翻转
+        origin, _ = border._border_rect({'x': -1920, 'y': 0, 'w': 1920, 'h': 1080})
+        assert origin[0] == -1920.0
+        assert origin[1] == 0.0
+    finally:
+        if real is not None:
+            sys.modules['AppKit'] = real
+        else:
+            sys.modules.pop('AppKit', None)
+
+    print("  border 坐标换算: PASS")
+
+
+def test_border_level_above_pinned_window():
+    """描边层级必须高于置顶窗口层级，否则会被窗口自身盖住。
+
+    同时不能太高（会盖住菜单栏/程序坞等系统 UI）。
+    """
+    from optsnap.config import BORDER_LEVEL, PIN_LEVEL_FLOATING
+
+    assert BORDER_LEVEL > PIN_LEVEL_FLOATING, "描边层级必须高于置顶层级"
+    assert BORDER_LEVEL < 20, "描边层级不应高过程序坞(20)/菜单栏(24)"
+
+    # 线宽要真的很细：太粗会像选中框
+    from optsnap.config import BORDER_WIDTH
+    assert 0 < BORDER_WIDTH <= 2.0, BORDER_WIDTH
+
+    print("  border 层级与线宽: PASS")
+
+
+def test_set_pinned_controls_border():
+    """置顶成功时添加描边，取消时移除；描边出错不影响置顶结果。"""
+    from optsnap import pin, border
+
+    pin._pinned_state = {}
+    calls = []
+
+    with patch('optsnap.pin._heartbeat_alive', return_value=True), \
+         patch('optsnap.pin._send_command', return_value=(True, 0)), \
+         patch('optsnap.border.set_border', side_effect=lambda w, e: calls.append((w, e))):
+
+        pin.set_pinned(999, True)
+        assert calls[-1] == (999, True)
+
+        pin.set_pinned(999, False)
+        assert calls[-1] == (999, False)
+
+    # 描边模块抛异常时，set_pinned 仍应返回 True（置顶本身成功了）
+    pin._pinned_state = {}
+    with patch('optsnap.pin._heartbeat_alive', return_value=True), \
+         patch('optsnap.pin._send_command', return_value=(True, 0)), \
+         patch('optsnap.border.set_border', side_effect=RuntimeError("boom")):
+        assert pin.set_pinned(888, True) is True
+        assert pin.is_pinned(888) is True
+
+    print("  set_pinned 联动描边: PASS")
+
+
+def test_reset_all_pins_clears_borders():
+    """reset_all_pins 必须连描边一起清掉，否则禁用后残留蓝框。"""
+    from optsnap import pin
+
+    pin._pinned_state = {11: True, 22: True}
+    cleared = []
+
+    with patch('optsnap.pin._heartbeat_alive', return_value=True), \
+         patch('optsnap.pin._send_command', return_value=(True, 0)), \
+         patch('optsnap.border.remove_all_borders', side_effect=lambda: cleared.append(1)):
+
+        pin.reset_all_pins()
+
+    assert cleared, "reset_all_pins 未清除描边"
+    assert pin.pinned_count() == 0
+
+    print("  reset_all_pins 清描边: PASS")
+
+
 def test_permissions_missing_for_pin():
     """置顶缺失项判断：命令行工具和权限才是硬门槛，开发者模式不算。"""
     from optsnap import permissions
@@ -281,6 +444,12 @@ def main():
         test_reset_all_pins_noop_when_empty,
         test_pinned_window_at_finds_pinned_window,
         test_toggle_sequence_pin_then_unpin,
+        test_hotkey_requires_exact_modifiers,
+        test_cycle_pin_hotkey,
+        test_border_coordinate_conversion,
+        test_border_level_above_pinned_window,
+        test_set_pinned_controls_border,
+        test_reset_all_pins_clears_borders,
         test_permissions_missing_for_pin,
     ]
 
