@@ -58,7 +58,15 @@ from ApplicationServices import (
 )
 
 from optsnap import window as win
-from optsnap.config import TOGGLE_KEYCODE, MODIFIER_NAME, HEALTH_CHECK_INTERVAL
+from optsnap import pin
+from optsnap.config import (
+    TOGGLE_KEYCODE,
+    MODIFIER_NAME,
+    HEALTH_CHECK_INTERVAL,
+    PIN_KEYCODE,
+    PIN_KEYCODES,
+    PIN_KEY_NAMES,
+)
 from optsnap.actions import MoveAction, ResizeAction, adjust_alpha, reset_all_alpha
 
 logger = logging.getLogger(__name__)
@@ -87,6 +95,11 @@ def _toggle_keycode_to_name(keycode):
     return _TOGGLE_KEY_NAMES.get(keycode, f"Key {keycode}")
 
 
+def _pin_keycode_to_name(keycode):
+    """置顶热键的显示名。"""
+    return PIN_KEY_NAMES.get(keycode, f"Key {keycode}")
+
+
 class OptSnapCore:
     """Encapsulated OptSnap engine.
 
@@ -94,10 +107,12 @@ class OptSnapCore:
     Runs the event loop in a separate thread so the GUI stays responsive.
     """
 
-    def __init__(self, modifier_name=None, toggle_keycode=None, on_state_change=None):
+    def __init__(self, modifier_name=None, toggle_keycode=None, on_state_change=None,
+                 pin_keycode=None):
         self.enabled = True
         self.modifier_mask = _MODIFIERS.get(modifier_name or MODIFIER_NAME, kCGEventFlagMaskAlternate)
         self.toggle_keycode = toggle_keycode or TOGGLE_KEYCODE
+        self.pin_keycode = pin_keycode or PIN_KEYCODE
         self.on_state_change = on_state_change  # callback for GUI refresh
 
         self.mode = "idle"
@@ -123,6 +138,8 @@ class OptSnapCore:
         logger.info(f"[OptSnap] {state}")
         if not self.enabled:
             reset_all_alpha()
+            # 置顶状态也要清掉，否则禁用后窗口会永远卡在浮动层
+            pin.reset_all_pins()
         # Always reset state machine to idle so re-enable starts clean
         self.mode = "idle"
         self.current_action = None
@@ -157,6 +174,43 @@ class OptSnapCore:
         if self.on_state_change:
             self.on_state_change()
 
+    def cycle_pin_key(self):
+        """轮换置顶热键。"""
+        try:
+            idx = PIN_KEYCODES.index(self.pin_keycode)
+        except ValueError:
+            idx = -1
+        self.pin_keycode = PIN_KEYCODES[(idx + 1) % len(PIN_KEYCODES)]
+        logger.info(f"置顶热键改为 {_pin_keycode_to_name(self.pin_keycode)}")
+        if self.on_state_change:
+            self.on_state_change()
+
+    def toggle_pin_under_cursor(self):
+        """切换鼠标指针下窗口的置顶状态。返回切换后的状态（None 表示失败）。
+
+        读鼠标位置再命中窗口，而不是用当前焦点窗口：置顶的典型使用场景是
+        「指着某个窗口把它钉住」，用指针位置更符合直觉，也避免切换焦点。
+
+        命中顺序很重要：先查「已置顶的窗口」，再查普通窗口。因为置顶后窗口的
+        layer 不再是 0，get_window_at_point 会跳过它 —— 不先查已置顶列表的话，
+        第二次按快捷键会命中下层窗口，导致取消置顶永远失效。
+        """
+        from Quartz import CGEventCreate, CGEventGetLocation
+        loc = CGEventGetLocation(CGEventCreate(None))
+
+        # 1) 指针下若有已置顶窗口，直接取消它
+        pinned_id = pin.pinned_window_at(loc.x, loc.y)
+        if pinned_id is not None:
+            pin.set_pinned(pinned_id, False)
+            return False
+
+        # 2) 否则找普通窗口并置顶
+        window_id, _ax_ref, _bounds = win.get_window_at_point(loc.x, loc.y)
+        if window_id is None:
+            logger.debug("置顶：指针下没有可用窗口")
+            return None
+        return pin.toggle_pin(window_id)
+
     # ── Permission check ──────────────────────────────────────────────
 
     @staticmethod
@@ -190,6 +244,11 @@ class OptSnapCore:
             keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
             if keycode == self.toggle_keycode:
                 self.toggle()
+                return None
+            # 置顶热键：即使 OptSnap 处于禁用状态也响应，
+            # 因为它和「全局开关」是并列的独立功能，不该被开关连坐。
+            if keycode == self.pin_keycode:
+                self.toggle_pin_under_cursor()
                 return None
 
         if not self.enabled:
@@ -333,6 +392,8 @@ class OptSnapCore:
             self._event_tap = None
 
         reset_all_alpha()
+        # 退出/停止时统一清掉置顶，别让用户的窗口留在浮动层回不去
+        pin.reset_all_pins()
         logger.info("OptSnap tap stopped")
 
     # ── Run / Stop ────────────────────────────────────────────────────
